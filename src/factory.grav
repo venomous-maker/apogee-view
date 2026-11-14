@@ -1,0 +1,335 @@
+// factory.grav — ViewFactory: finds templates ("users.show" is
+// views/users/show.tpl.html), parses each once (again only when the file
+// changes, with checkForChanges), and renders them with layouts, sections,
+// stacks, includes and components.
+//
+//   let views = new ViewFactory(["resources/views"])
+//   views.share("appName", "Shop")
+//   views.composer("layouts.*", fn(name: string, data: HashMap<string, any>) { data.put("menu", menu()) })
+//   views.helper("money", fn(args: Array<any>, ctx: RenderContext) -> any { return formatMoney(args[0]) })
+//   return views.response(req, "users.show", {"user": user})
+import "std"
+import "apogee-http"
+import "expr.grav"
+import "eval.grav"
+import "template.grav"
+import "helpers.grav"
+
+namespace apogee {
+
+    class ViewFactory {
+        public paths: Array<string>
+        public extension: string = ".tpl.html"
+        // Re-read a template whose file changed (development); off, a template is parsed once.
+        public checkForChanges: bool = true
+        // What @env and @production compare with.
+        public environment: string = "production"
+        // How route() names become URLs (the router's url()); unset, route() is an error.
+        public urlFor: fn(string, HashMap<string, any>) -> string
+        // Prefix for asset() ("/static", or a CDN's URL).
+        public assetRoot: string = ""
+        public helpers: HashMap<string, fn(Array<any>, RenderContext) -> any>
+        private namespaces: HashMap<string, string>
+        private shared: HashMap<string, any>
+        private composers: Array<Pair<string, fn(string, HashMap<string, any>)>>
+        private cache: HashMap<string, Template>
+        private lock: Mutex
+
+        constructor(paths: Array<string>) {
+            self.paths = paths;
+            self.urlFor = null;
+            self.helpers = new HashMap<string, fn(Array<any>, RenderContext) -> any>();
+            self.namespaces = new HashMap<string, string>();
+            self.shared = new HashMap<string, any>();
+            self.composers = new Array<Pair<string, fn(string, HashMap<string, any>)>>();
+            self.cache = new HashMap<string, Template>();
+            self.lock = new Mutex();
+            ViewHelpers.install(self);
+        }
+
+        // ── setup ──────────────────────────────────────────────────────────────
+        // A value every view sees.
+        fn share(key: string, value: any) -> ViewFactory { self.shared.put(key, value); return self; }
+        // `f` adds data to every view whose name matches `pattern` ("layouts.*", "*").
+        fn composer(pattern: string, f: fn(string, HashMap<string, any>)) -> ViewFactory {
+            self.composers.push(new Pair<string, fn(string, HashMap<string, any>)>(pattern, f)); return self;
+        }
+        // A function templates can call, and use as a filter: {{ price | money }}.
+        fn helper(name: string, f: fn(Array<any>, RenderContext) -> any) -> ViewFactory { self.helpers.put(name, f); return self; }
+        // "mail::welcome" is `dir`/welcome.tpl.html.
+        fn addNamespace(ns: string, dir: string) -> ViewFactory { self.namespaces.put(ns, dir); return self; }
+        fn exists(name: string) -> bool { return self.pathOf(name) != ""; }
+
+        // ── rendering ──────────────────────────────────────────────────────────
+        fn render(name: string, data: HashMap<string, any> = new HashMap<string, any>(), req: Request = null) -> string {
+            let vars = new HashMap<string, any>();
+            self.shared.forEach(fn(k: string, v: any) { vars.put(k, v); });
+            data.forEach(fn(k: string, v: any) { vars.put(k, v); });
+            let ctx = new RenderContext(new Scope(vars, null), self.helpers);
+            ctx.request = req;
+            if (req != null) {
+                vars.put("request", req);
+                if (!vars.containsKey("errors")) { vars.put("errors", ViewFactory.errorsOf(req)); }
+                if (!vars.containsKey("user") && req.user != null) { vars.put("user", req.user); }
+            }
+            let me = self;
+            ctx.include = fn(n: string, d: HashMap<string, any>, c: RenderContext) -> string { return me.renderPartial(n, d, c); };
+            return self.renderView(name, ctx);
+        }
+        // An HTML response of the rendered view.
+        fn response(req: Request, name: string, data: HashMap<string, any> = new HashMap<string, any>(), status: int = 200) -> Response {
+            return Response.html(self.render(name, data, req), status);
+        }
+        // A template from text (not a file): mail bodies, previews, tests.
+        fn renderString(src: string, data: HashMap<string, any> = new HashMap<string, any>()) -> string {
+            let t = TemplateParser.parse(src, "(string)");
+            let vars = new HashMap<string, any>();
+            self.shared.forEach(fn(k: string, v: any) { vars.put(k, v); });
+            data.forEach(fn(k: string, v: any) { vars.put(k, v); });
+            let ctx = new RenderContext(new Scope(vars, null), self.helpers);
+            let me = self;
+            ctx.include = fn(n: string, d: HashMap<string, any>, c: RenderContext) -> string { return me.renderPartial(n, d, c); };
+            return self.renderTemplate(t, ctx);
+        }
+        // (a view with its own layout, sharing the caller's sections and stacks)
+        private fn renderView(name: string, ctx: RenderContext) -> string {
+            for (c in self.composers) { if (Request.glob(c.first, name)) { c.second(name, ctx.scope.vars); } }
+            return self.renderTemplate(self.load(name), ctx);
+        }
+        private fn renderTemplate(t: Template, ctx: RenderContext) -> string {
+            let saved = ctx.view;
+            ctx.view = t.name;
+            let out = new StringBuilder();
+            self.nodes(t.nodes, ctx, out);
+            ctx.view = saved;
+            if (t.extends == null) { return out.toString(); }
+            // A child: its output is its sections; the layout renders with them.
+            return self.renderView(Eval.text(Eval.value(t.extends, ctx)), ctx);
+        }
+        // @include: the view with its own variables over the caller's.
+        fn renderPartial(name: string, data: HashMap<string, any>, ctx: RenderContext) -> string {
+            ctx.push(data);
+            let savedLoop = ctx.loop;
+            let out = "";
+            try { out = self.renderView(name, ctx); } finally { ctx.pop(); ctx.loop = savedLoop; }
+            return out;
+        }
+
+        // ── templates ──────────────────────────────────────────────────────────
+        private fn pathOf(name: string) -> string {
+            let sep = Str.indexOf(name, "::");
+            if (sep > 0) {
+                let dir = self.namespaces.getOr(name[..sep], "");
+                if (dir == "") { return ""; }
+                let p = dir + "/" + Str.replace(name[sep + 2..], ".", "/") + self.extension;
+                return new File(p).exists() ? p : "";
+            }
+            let rel = Str.replace(name, ".", "/") + self.extension;
+            for (d in self.paths) { let p = d + "/" + rel; if (new File(p).exists()) { return p; } }
+            return "";
+        }
+        fn load(name: string) -> Template {
+            self.lock.lock();
+            let t = self.cache.getOr(name, null);
+            self.lock.unlock();
+            if (t != null && !self.checkForChanges) { return t; }
+            let path = self.pathOf(name);
+            if (path == "") { throw new ViewError("no view '" + name + "' (looked in " + Str.join(self.paths, ", ") + " for " + Str.replace(name, ".", "/") + self.extension + ")"); }
+            let f = new File(path);
+            let mtime = f.modified();
+            if (t != null && t.modified == mtime) { return t; }
+            let fresh = TemplateParser.parse(f.readOr(""), name);
+            fresh.modified = mtime;
+            self.lock.lock();
+            self.cache.put(name, fresh);
+            self.lock.unlock();
+            return fresh;
+        }
+        // Forgets parsed templates (after deploying new ones without checkForChanges).
+        fn flush() { self.lock.lock(); self.cache.clear(); self.lock.unlock(); }
+
+        // ── nodes ──────────────────────────────────────────────────────────────
+        fn nodes(list: Array<TNode>, ctx: RenderContext, out: StringBuilder) {
+            for (n in list) { self.node(n, ctx, out); }
+        }
+        private fn node(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            switch (n.kind) {
+                case 0: out.append(n.text)
+                case 1: {
+                    let v = Eval.value(n.expr, ctx);
+                    if (n.raw) { out.append(Eval.text(v)); } else { ViewHelpers.escapeInto(out, Eval.text(v)); }
+                }
+                case 2: {
+                    for (i, cond in n.exprs) {
+                        if (Eval.truthy(Eval.value(cond, ctx))) { self.nodes(n.bodies[i], ctx, out); return; }
+                    }
+                    if (n.other != null) { self.nodes(n.other, ctx, out); }
+                }
+                case 3: self.foreach(n, ctx, out)
+                case 4: self.include(n, ctx, out)
+                case 5: self.section(n, ctx, out)
+                case 6: {
+                    let name = Eval.text(Eval.value(n.exprs[0], ctx));
+                    if (ctx.sections.containsKey(name)) { out.append(Str.replace(ctx.sections[name], ViewFactory.parentMark, "")); }
+                    else if (n.exprs.size() > 1) { out.append(HttpException.escape(Eval.text(Eval.value(n.exprs[1], ctx)))); }
+                }
+                case 7: {
+                    let name = Eval.text(Eval.value(n.expr, ctx));
+                    let sb = new StringBuilder();
+                    self.nodes(n.body, ctx, sb);
+                    let list = ctx.stacks.getOr(name, null);
+                    if (list == null) { list = new Array<string>(); ctx.stacks.put(name, list); }
+                    if (n.raw) { list.insert(0, sb.toString()); } else { list.push(sb.toString()); }
+                }
+                case 8: { let list = ctx.stacks.getOr(Eval.text(Eval.value(n.expr, ctx)), null); if (list != null) { for (x in list) { out.append(x); } } }
+                case 9: { if (!ctx.once.contains(n.text)) { ctx.once.add(n.text); self.nodes(n.body, ctx, out); } }
+                case 10: out.append("<input type=\"hidden\" name=\"_token\" value=\"").append(HttpException.escape(ViewHelpers.csrfToken(ctx))).append("\">")
+                case 11: out.append("<input type=\"hidden\" name=\"_method\" value=\"").append(HttpException.escape(Str.upper(Eval.text(Eval.value(n.expr, ctx))))).append("\">")
+                case 12: {
+                    let field = Eval.text(Eval.value(n.exprs[0], ctx));
+                    let bag = n.exprs.size() > 1 ? Eval.text(Eval.value(n.exprs[1], ctx)) : "default";
+                    let msg = ViewFactory.firstError(ctx, field, bag);
+                    if (msg != "") {
+                        let vars = new HashMap<string, any>(); vars.put("message", msg);
+                        ctx.push(vars); self.nodes(n.body, ctx, out); ctx.pop();
+                    } else if (n.other != null) { self.nodes(n.other, ctx, out); }
+                }
+                case 13: out.append(JsonWriter.encode(Eval.value(n.expr, ctx)))
+                case 14: {
+                    let v = Eval.value(n.expr, ctx);
+                    for (i, c in n.exprs) { if (Eval.equal(v, Eval.value(c, ctx))) { self.nodes(n.bodies[i], ctx, out); return; } }
+                    if (n.other != null) { self.nodes(n.other, ctx, out); }
+                }
+                case 15: {
+                    let signedIn = ctx.request != null && ctx.request.user != null;
+                    if (signedIn != n.raw) { self.nodes(n.body, ctx, out); } else if (n.other != null) { self.nodes(n.other, ctx, out); }
+                }
+                case 16: {
+                    let hit = false;
+                    for (e in n.exprs) { if (Eval.text(Eval.value(e, ctx)) == self.environment) { hit = true; } }
+                    if (hit) { self.nodes(n.body, ctx, out); } else if (n.other != null) { self.nodes(n.other, ctx, out); }
+                }
+                case 17: { if (Eval.truthy(Eval.value(n.expr, ctx))) { out.append(n.text); } }
+                case 18: out.append("class=\"").append(HttpException.escape(ViewHelpers.classes(Eval.value(n.expr, ctx)))).append("\"")
+                case 19: self.component(n, ctx, out)
+                case 20: out.append(ViewFactory.parentMark)
+                case 21: self.each(n, ctx, out)
+                default: ctx.set(n.text, Eval.value(n.expr, ctx))
+            }
+        }
+        // The placeholder @parent leaves in a child's section, filled by the layout's.
+        public static parentMark: string = "\u{1}@parent\u{1}"
+
+        private fn foreach(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            let source = Eval.value(n.expr, ctx);
+            let items = Eval.items(source);
+            if (items.size() == 0) { if (n.other != null) { self.nodes(n.other, ctx, out); } return; }
+            let keys: Array<string> = null;
+            if (source is HashMap<string, any> && n.names.size() > 1) { keys = (source as HashMap<string, any>).keys(); Sort.sort(keys); }
+            let outer = ctx.loop;
+            let loop = new LoopVar(items.size(), outer == null ? 1 : outer.depth + 1, outer);
+            ctx.loop = loop;
+            let vars = new HashMap<string, any>();
+            ctx.push(vars);
+            try {
+                for (i, x in items) {
+                    loop.index = i;
+                    vars.put(n.names[0], x);
+                    if (n.names.size() > 1) { vars.put(n.names[1], keys != null ? keys[i] as any : i as any); }
+                    vars.put("loop", loop);
+                    self.nodes(n.body, ctx, out);
+                }
+            } finally { ctx.pop(); ctx.loop = outer; }
+        }
+        private fn include(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            let args = new Array<any>();
+            for (e in n.exprs) { args.push(Eval.value(e, ctx)); }
+            let name = "";
+            let data: any = null;
+            switch (n.text) {
+                case "includeWhen": { if (!Eval.truthy(args[0])) { return; } name = Eval.text(args[1]); data = args.size() > 2 ? args[2] : null; }
+                case "includeFirst": {
+                    for (x in Eval.items(args[0])) { if (self.exists(Eval.text(x))) { name = Eval.text(x); break; } }
+                    if (name == "") { throw new ViewError(ctx.view + ": none of the views in @includeFirst exist"); }
+                    data = args.size() > 1 ? args[1] : null;
+                }
+                default: { name = Eval.text(args[0]); data = args.size() > 1 ? args[1] : null; }
+            }
+            if (n.text == "includeIf" && !self.exists(name)) { return; }
+            let vars = data is HashMap<string, any> ? data as HashMap<string, any> : new HashMap<string, any>();
+            out.append(self.renderPartial(name, vars, ctx));
+        }
+        // @each('view', items, 'item', 'empty view')
+        private fn each(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            let view = Eval.text(Eval.value(n.exprs[0], ctx));
+            let items = Eval.items(Eval.value(n.exprs[1], ctx));
+            let itemName = n.exprs.size() > 2 ? Eval.text(Eval.value(n.exprs[2], ctx)) : "item";
+            if (items.size() == 0) {
+                if (n.exprs.size() > 3) { out.append(self.renderPartial(Eval.text(Eval.value(n.exprs[3], ctx)), new HashMap<string, any>(), ctx)); }
+                return;
+            }
+            for (i, x in items) {
+                let vars = new HashMap<string, any>(); vars.put(itemName, x); vars.put("key", i);
+                out.append(self.renderPartial(view, vars, ctx));
+            }
+        }
+        // A child defines a section (the first definition, deepest child, wins;
+        // its @parent takes this one's body); a layout's @section ... @show prints it.
+        private fn section(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            let name = Eval.text(Eval.value(n.expr, ctx));
+            let mine = "";
+            if (n.exprs != null) { mine = HttpException.escape(Eval.text(Eval.value(n.exprs[0], ctx))); }
+            else { let sb = new StringBuilder(); self.nodes(n.body, ctx, sb); mine = sb.toString(); }
+            let merged = ctx.sections.containsKey(name) ? Str.replace(ctx.sections[name], ViewFactory.parentMark, mine) : mine;
+            ctx.sections.put(name, merged);
+            if (n.raw) { out.append(Str.replace(merged, ViewFactory.parentMark, "")); }
+        }
+        // <x-alert type="error" :count="n">: the view components.alert, with the
+        // attributes as variables (and `attributes`), the body as `slot`, named slots by name.
+        private fn component(n: TNode, ctx: RenderContext, out: StringBuilder) {
+            let vars = new HashMap<string, any>();
+            let attrs = new HashMap<string, any>();
+            for (i, k in n.names) { let v = Eval.value(n.exprs[i], ctx); vars.put(ViewHelpers.camel(k), v); attrs.put(k, v); }
+            vars.put("attributes", attrs);
+            let body = new StringBuilder();
+            self.nodes(n.body, ctx, body);
+            vars.put("slot", Str.trim(body.toString()));
+            n.slots.forEach(fn(slot: string, nodes: Array<TNode>) {
+                let sb = new StringBuilder();
+                self.nodes(nodes, ctx, sb);
+                vars.put(ViewHelpers.camel(slot), Str.trim(sb.toString()));
+            });
+            // Components see their own variables, not the caller's.
+            let saved = ctx.scope;
+            ctx.scope = new Scope(vars, new Scope(self.shared, null));
+            try { out.append(self.renderView("components." + n.text, ctx)); } finally { ctx.scope = saved; }
+        }
+
+        // ── errors from the session (a failed form) ────────────────────────────
+        static fn errorsOf(req: Request) -> HashMap<string, any> {
+            if (!(req.session is FlashStore)) { return new HashMap<string, any>(); }
+            let all = (req.session as FlashStore).flashed("errors");
+            if (all is HashMap<string, any>) {
+                let b = (all as HashMap<string, any>).getOr("default", null);
+                if (b is HashMap<string, any>) { return b as HashMap<string, any>; }
+            }
+            return new HashMap<string, any>();
+        }
+        static fn firstError(ctx: RenderContext, field: string, bag: string) -> string {
+            if (ctx.request == null || !(ctx.request.session is FlashStore)) {
+                let local = ctx.scope.lookup("errors");
+                if (local is HashMap<string, any>) {
+                    let l = (local as HashMap<string, any>).getOr(field, null);
+                    if (l is Array<any> && (l as Array<any>).size() > 0) { return Eval.text((l as Array<any>)[0]); }
+                }
+                return "";
+            }
+            let all = (ctx.request.session as FlashStore).flashed("errors");
+            if (!(all is HashMap<string, any>)) { return ""; }
+            let b = (all as HashMap<string, any>).getOr(bag, null);
+            if (!(b is HashMap<string, any>)) { return ""; }
+            let list = (b as HashMap<string, any>).getOr(field, null);
+            return list is Array<any> && (list as Array<any>).size() > 0 ? Eval.text((list as Array<any>)[0]) : "";
+        }
+    }
+}
