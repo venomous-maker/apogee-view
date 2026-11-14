@@ -1,0 +1,316 @@
+// expr.grav — the expressions inside templates: parsed once into a small
+// tree, then evaluated against the view's variables on every render.
+//
+//   {{ user.name }}  {{ items[0].price * qty }}  {{ title ?? "Untitled" }}
+//   {{ count > 1 ? "items" : "item" }}  {{ name | upper }}  {{ "admin" in roles }}
+//   {{ route("users.show", {"id": user.id}) }}  {{ user.fullName() }}
+//
+// Values are what the view was given: null, bool, numbers, strings,
+// Array<any>, HashMap<string, any>, and objects (fields and methods through
+// reflection). Maps answer member access by key; `.length`/`.count` work on
+// strings, lists and maps.
+import "std"
+import "apogee-http"
+
+namespace apogee {
+
+    // A template error: the template, its line, and what is wrong.
+    class ViewError extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "ViewError"; }
+    }
+
+    // One node of an expression (kind picks which fields it uses).
+    class VExpr {
+        // 0 literal, 1 name, 2 member, 3 index, 4 helper call, 5 method call,
+        // 6 unary, 7 binary, 8 ternary, 9 list, 10 map
+        public kind: int
+        public value: any
+        public name: string
+        public a: VExpr
+        public b: VExpr
+        public c: VExpr
+        public args: Array<VExpr>
+        public keys: Array<string>
+        constructor(kind: int) { self.kind = kind; self.value = null; self.name = ""; self.a = null; self.b = null; self.c = null; self.args = null; self.keys = null; }
+    }
+
+    // A `loop` variable inside @foreach.
+    class LoopVar {
+        public index: int
+        public count: int
+        public depth: int
+        public parent: LoopVar
+        constructor(count: int, depth: int, parent: LoopVar) { self.index = 0; self.count = count; self.depth = depth; self.parent = parent; }
+        fn get(name: string) -> any {
+            switch (name) {
+                case "index": return self.index
+                case "iteration": return self.index + 1
+                case "remaining": return self.count - self.index - 1
+                case "count": return self.count
+                case "first": return self.index == 0
+                case "last": return self.index == self.count - 1
+                case "even": return (self.index + 1) % 2 == 0
+                case "odd": return (self.index + 1) % 2 == 1
+                case "depth": return self.depth
+                case "parent": return self.parent
+                default: return null
+            }
+        }
+    }
+
+    // ── parsing ────────────────────────────────────────────────────────────────
+    class ExprParser {
+        private src: string
+        private pos: int
+        private where: string
+        constructor(src: string, where: string) { self.src = src; self.pos = 0; self.where = where; }
+        static fn parse(src: string, where: string) -> VExpr {
+            let p = new ExprParser(src, where);
+            let e = p.ternary();
+            p.skip();
+            if (p.pos < p.src.length) { p.fail("unexpected '" + p.src[p.pos..] + "'"); }
+            return e;
+        }
+        // Several expressions separated by top-level commas ("'name', {...}").
+        static fn parseList(src: string, where: string) -> Array<VExpr> {
+            let p = new ExprParser(src, where);
+            let out = new Array<VExpr>();
+            p.skip();
+            if (p.pos >= p.src.length) { return out; }
+            out.push(p.ternary());
+            while (p.eat(",")) { out.push(p.ternary()); }
+            p.skip();
+            if (p.pos < p.src.length) { p.fail("unexpected '" + p.src[p.pos..] + "'"); }
+            return out;
+        }
+        fn fail(why: string) { throw new ViewError(self.where + ": " + why + " in {{ " + self.src + " }}"); }
+
+        private fn skip() { while (self.pos < self.src.length && (self.src[self.pos] as int) <= 32) { self.pos += 1; } }
+        private fn peekIs(s: string) -> bool {
+            self.skip();
+            return self.pos + s.length <= self.src.length && self.src[self.pos..self.pos + s.length] == s;
+        }
+        private fn eat(s: string) -> bool { if (self.peekIs(s)) { self.pos += s.length; return true; } return false; }
+        private fn word() -> string {
+            self.skip();
+            let start = self.pos;
+            while (self.pos < self.src.length) {
+                let c = self.src[self.pos] as int;
+                if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (self.pos > start && c >= 48 && c <= 57)) { self.pos += 1; } else { break; }
+            }
+            return self.src[start..self.pos];
+        }
+        private fn eatWord(w: string) -> bool {
+            self.skip();
+            let save = self.pos;
+            if (self.word() == w) { return true; }
+            self.pos = save;
+            return false;
+        }
+
+        private fn ternary() -> VExpr {
+            let cond = self.coalesce();
+            if (self.peekIs("??")) { return cond; }
+            if (self.eat("?")) {
+                let t = new VExpr(8);
+                t.a = cond;
+                t.b = self.ternary();
+                if (!self.eat(":")) { self.fail("expected ':' in a ? b : c"); }
+                t.c = self.ternary();
+                return t;
+            }
+            return cond;
+        }
+        private fn coalesce() -> VExpr {
+            let left = self.orExpr();
+            while (self.eat("??")) { left = ExprParser.bin("??", left, self.orExpr()); }
+            return left;
+        }
+        private fn orExpr() -> VExpr {
+            let left = self.andExpr();
+            while (self.eat("||") || self.eatWord("or")) { left = ExprParser.bin("||", left, self.andExpr()); }
+            return left;
+        }
+        private fn andExpr() -> VExpr {
+            let left = self.compare();
+            while (self.eat("&&") || self.eatWord("and")) { left = ExprParser.bin("&&", left, self.compare()); }
+            return left;
+        }
+        private fn compare() -> VExpr {
+            let left = self.additive();
+            while (true) {
+                if (self.eat("==")) { left = ExprParser.bin("==", left, self.additive()); }
+                else if (self.eat("!=")) { left = ExprParser.bin("!=", left, self.additive()); }
+                else if (self.eat("<=")) { left = ExprParser.bin("<=", left, self.additive()); }
+                else if (self.eat(">=")) { left = ExprParser.bin(">=", left, self.additive()); }
+                else if (self.eat("<")) { left = ExprParser.bin("<", left, self.additive()); }
+                else if (self.eat(">")) { left = ExprParser.bin(">", left, self.additive()); }
+                else if (self.eatWord("in")) { left = ExprParser.bin("in", left, self.additive()); }
+                else if (self.peekIs("not") && self.notIn()) { left = ExprParser.bin("notin", left, self.additive()); }
+                else { return left; }
+            }
+            return left;
+        }
+        private fn notIn() -> bool {
+            let save = self.pos;
+            if (self.eatWord("not") && self.eatWord("in")) { return true; }
+            self.pos = save;
+            return false;
+        }
+        private fn additive() -> VExpr {
+            let left = self.multiplicative();
+            while (true) {
+                if (self.peekIs("+")) { self.pos += 1; left = ExprParser.bin("+", left, self.multiplicative()); }
+                else if (self.peekIs("-")) { self.pos += 1; left = ExprParser.bin("-", left, self.multiplicative()); }
+                else if (self.peekIs("~")) { self.pos += 1; left = ExprParser.bin("~", left, self.multiplicative()); }
+                else { return left; }
+            }
+            return left;
+        }
+        private fn multiplicative() -> VExpr {
+            let left = self.filtered();
+            while (true) {
+                if (self.peekIs("*")) { self.pos += 1; left = ExprParser.bin("*", left, self.filtered()); }
+                else if (self.peekIs("/")) { self.pos += 1; left = ExprParser.bin("/", left, self.filtered()); }
+                else if (self.peekIs("%")) { self.pos += 1; left = ExprParser.bin("%", left, self.filtered()); }
+                else { return left; }
+            }
+            return left;
+        }
+        // x | upper | default("-"): a filter is a helper with x as its first argument.
+        private fn filtered() -> VExpr {
+            let left = self.unary();
+            while (self.peekIs("|") && !self.peekIs("||")) {
+                self.pos += 1;
+                let name = self.word();
+                if (name == "") { self.fail("expected a filter name after '|'"); }
+                let call = new VExpr(4);
+                call.name = name;
+                call.args = new Array<VExpr>();
+                call.args.push(left);
+                if (self.eat("(")) { self.argsInto(call.args); }
+                left = call;
+            }
+            return left;
+        }
+        private fn unary() -> VExpr {
+            if (self.eat("!") || self.eatWord("not")) { let u = new VExpr(6); u.name = "!"; u.a = self.unary(); return u; }
+            if (self.peekIs("-")) { self.pos += 1; let u = new VExpr(6); u.name = "-"; u.a = self.unary(); return u; }
+            return self.postfix();
+        }
+        private fn postfix() -> VExpr {
+            let e = self.primary();
+            while (true) {
+                if (self.eat(".")) {
+                    let name = self.word();
+                    if (name == "") { self.fail("expected a name after '.'"); }
+                    if (self.eat("(")) {
+                        let m = new VExpr(5); m.a = e; m.name = name; m.args = new Array<VExpr>(); self.argsInto(m.args); e = m;
+                    } else {
+                        let m = new VExpr(2); m.a = e; m.name = name; e = m;
+                    }
+                } else if (self.peekIs("[")) {
+                    self.pos += 1;
+                    let ix = new VExpr(3); ix.a = e; ix.b = self.ternary();
+                    if (!self.eat("]")) { self.fail("expected ']'"); }
+                    e = ix;
+                } else { return e; }
+            }
+            return e;
+        }
+        private fn argsInto(out: Array<VExpr>) {
+            if (self.eat(")")) { return; }
+            out.push(self.ternary());
+            while (self.eat(",")) { out.push(self.ternary()); }
+            if (!self.eat(")")) { self.fail("expected ')'"); }
+        }
+        private fn primary() -> VExpr {
+            self.skip();
+            if (self.pos >= self.src.length) { self.fail("expected a value"); }
+            let c = self.src[self.pos] as int;
+            if (c == 40) {                                                       // ( ... )
+                self.pos += 1;
+                let e = self.ternary();
+                if (!self.eat(")")) { self.fail("expected ')'"); }
+                return e;
+            }
+            if (c == 34 || c == 39) { return ExprParser.lit(self.stringLit(c)); }
+            if (c >= 48 && c <= 57) { return self.number(); }
+            if (c == 91) {                                                       // [a, b]
+                self.pos += 1;
+                let l = new VExpr(9); l.args = new Array<VExpr>();
+                if (!self.eat("]")) {
+                    l.args.push(self.ternary());
+                    while (self.eat(",")) { if (self.peekIs("]")) { break; } l.args.push(self.ternary()); }
+                    if (!self.eat("]")) { self.fail("expected ']'"); }
+                }
+                return l;
+            }
+            if (c == 123) {                                                      // {"k": v}
+                self.pos += 1;
+                let m = new VExpr(10); m.args = new Array<VExpr>(); m.keys = new Array<string>();
+                if (!self.eat("}")) {
+                    while (true) {
+                        self.skip();
+                        let q = self.src[self.pos] as int;
+                        let key = q == 34 || q == 39 ? self.stringLit(q) : self.word();
+                        if (key == "" || !self.eat(":")) { self.fail("expected \"key\": value in a map"); }
+                        m.keys.push(key);
+                        m.args.push(self.ternary());
+                        if (!self.eat(",")) { break; }
+                        if (self.peekIs("}")) { break; }
+                    }
+                    if (!self.eat("}")) { self.fail("expected '}'"); }
+                }
+                return m;
+            }
+            let name = self.word();
+            if (name == "") { self.fail("unexpected '" + self.src[self.pos..self.pos + 1] + "'"); }
+            switch (name) {
+                case "true": return ExprParser.lit(true)
+                case "false": return ExprParser.lit(false)
+                case "null": return ExprParser.lit(null)
+                default: {}
+            }
+            if (self.eat("(")) {
+                let call = new VExpr(4); call.name = name; call.args = new Array<VExpr>(); self.argsInto(call.args);
+                return call;
+            }
+            let n = new VExpr(1); n.name = name;
+            return n;
+        }
+        private fn number() -> VExpr {
+            let start = self.pos;
+            let dot = false;
+            while (self.pos < self.src.length) {
+                let c = self.src[self.pos] as int;
+                if (c >= 48 && c <= 57) { self.pos += 1; }
+                else if (c == 46 && !dot && self.pos + 1 < self.src.length && (self.src[self.pos + 1] as int) >= 48 && (self.src[self.pos + 1] as int) <= 57) { dot = true; self.pos += 1; }
+                else { break; }
+            }
+            let t = self.src[start..self.pos];
+            return dot ? ExprParser.lit(Format.toFloatOr(t, 0.0)) : ExprParser.lit(Integer.parseOr(t, 0));
+        }
+        private fn stringLit(q: int) -> string {
+            self.pos += 1;
+            let sb = new StringBuilder();
+            while (self.pos < self.src.length) {
+                let c = self.src[self.pos] as int;
+                if (c == q) { self.pos += 1; return sb.toString(); }
+                if (c == 92 && self.pos + 1 < self.src.length) {
+                    let e = self.src[self.pos + 1] as int;
+                    sb.appendChar(e == 110 ? 10 : (e == 116 ? 9 : e));
+                    self.pos += 2;
+                    continue;
+                }
+                sb.appendChar(c);
+                self.pos += 1;
+            }
+            self.fail("unterminated string");
+            return "";
+        }
+        static fn lit(v: any) -> VExpr { let e = new VExpr(0); e.value = v; return e; }
+        static fn bin(op: string, a: VExpr, b: VExpr) -> VExpr { let e = new VExpr(7); e.name = op; e.a = a; e.b = b; return e; }
+    }
+}
