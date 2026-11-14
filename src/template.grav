@@ -1,0 +1,438 @@
+// template.grav — a template file as a tree of nodes: parsed once (text,
+// {{ echoes }}, @directives, <x-components>), rendered many times.
+import "std"
+import "apogee-http"
+import "expr.grav"
+import "eval.grav"
+
+namespace apogee {
+
+    // One piece of a template (kind picks the fields it uses).
+    class TNode {
+        // 0 text, 1 echo, 2 if, 3 foreach, 4 include, 5 section, 6 yield, 7 push,
+        // 8 stack, 9 once, 10 csrf, 11 method, 12 error, 13 json, 14 switch,
+        // 15 auth/guest, 16 env, 17 attribute flag, 18 class, 19 component,
+        // 20 @parent, 21 each, 22 set
+        public kind: int
+        public text: string
+        public raw: bool
+        public expr: VExpr
+        public exprs: Array<VExpr>
+        public bodies: Array<Array<TNode>>
+        public body: Array<TNode>
+        public other: Array<TNode>
+        public names: Array<string>
+        public slots: HashMap<string, Array<TNode>>
+        public line: int
+        constructor(kind: int, line: int) {
+            self.kind = kind; self.line = line; self.text = ""; self.raw = false; self.expr = null; self.exprs = null;
+            self.bodies = null; self.body = null; self.other = null; self.names = null; self.slots = null;
+        }
+    }
+
+    class Template {
+        public name: string
+        public nodes: Array<TNode>
+        // @extends: the layout's name (an expression), or null.
+        public extends: VExpr
+        public modified: long
+        constructor(name: string) { self.name = name; self.nodes = new Array<TNode>(); self.extends = null; self.modified = 0; }
+    }
+
+    // A lexical piece: text, an echo, a directive (name + its "(...)"), or a component tag.
+    class Tok {
+        public kind: int          // 0 text, 1 echo, 2 raw echo, 3 directive, 4 component open, 5 component close, 6 component self-closing
+        public text: string
+        public args: string
+        public hasArgs: bool
+        public line: int
+        constructor(kind: int, text: string, line: int) { self.kind = kind; self.text = text; self.args = ""; self.hasArgs = false; self.line = line; }
+    }
+
+    class TemplateParser {
+        private src: string
+        private name: string
+        private toks: Array<Tok>
+        private pos: int
+        private onceCount: int
+        constructor(src: string, name: string) { self.src = src; self.name = name; self.toks = new Array<Tok>(); self.pos = 0; self.onceCount = 0; }
+
+        static fn parse(src: string, name: string) -> Template {
+            let p = new TemplateParser(src, name);
+            p.tokenize();
+            let t = new Template(name);
+            t.nodes = p.block(new Array<string>(), t);
+            if (p.pos < p.toks.size()) { p.fail(p.toks[p.pos].line, "unexpected @" + p.toks[p.pos].text); }
+            return t;
+        }
+        fn fail(line: int, why: string) { throw new ViewError(self.name + ":" + "${line}" + ": " + why); }
+
+        // ── tokens ─────────────────────────────────────────────────────────────
+        private fn tokenize() {
+            let s = self.src;
+            let n = s.length;
+            let i = 0;
+            let line = 1;
+            let text = new StringBuilder();
+            let textLine = 1;
+            let directiveEnd = -1;              // where the last directive ended (a directive may follow at once)
+            
+            while (i < n) {
+                let c = s[i] as int;
+                if (c == 10) { line += 1; }
+                if (c == 123 && i + 1 < n && s[i + 1] as int == 123) {                 // {{
+                    if (i + 3 < n && s[i + 2] as int == 45 && s[i + 3] as int == 45) {  // {{-- comment --}}
+                        let end = TemplateParser.find(s, "--}}", i + 4);
+                        if (end < 0) { self.fail(line, "unclosed {{-- comment"); }
+                        line += TemplateParser.lines(s[i..end]);
+                        i = end + 4;
+                        continue;
+                    }
+                    let end = TemplateParser.find(s, "}}", i + 2);
+                    if (end < 0) { self.fail(line, "unclosed {{"); }
+                    self.textTok(text, textLine);
+                    self.toks.push(new Tok(1, Str.trim(s[i + 2..end]), line));
+                    line += TemplateParser.lines(s[i..end]);
+                    i = end + 2;
+                    textLine = line;
+                    continue;
+                }
+                if (c == 123 && i + 2 < n && s[i + 1] as int == 33 && s[i + 2] as int == 33) {   // {!! raw !!}
+                    let end = TemplateParser.find(s, "!!}", i + 3);
+                    if (end < 0) { self.fail(line, "unclosed {!!"); }
+                    self.textTok(text, textLine);
+                    self.toks.push(new Tok(2, Str.trim(s[i + 3..end]), line));
+                    line += TemplateParser.lines(s[i..end]);
+                    i = end + 3;
+                    textLine = line;
+                    continue;
+                }
+                if (c == 64) {                                                       // @
+                    if (i + 1 < n && s[i + 1] as int == 64) { text.appendChar(64); i += 2; continue; }   // @@ -> @
+                    if (i + 2 < n && s[i + 1] as int == 123 && s[i + 2] as int == 123) { text.append("{{"); i += 3; continue; }   // @{{ -> {{
+                    let prev = i > 0 ? s[i - 1] as int : 32;
+                    let wordBefore = (prev >= 97 && prev <= 122) || (prev >= 65 && prev <= 90) || (prev >= 48 && prev <= 57) || prev == 46;
+                    let j = i + 1;
+                    while (j < n && TemplateParser.isWord(s[j] as int)) { j += 1; }
+                    let word = s[i + 1..j];
+                    // (after a word only a closing/branch directive counts: me@example.com stays text)
+                    let closing = Str.startsWith(word, "end") || Str.contains(",else,elseif,empty,break,show,stop,case,default,parent,", "," + word + ",");
+                    if ((!wordBefore || closing || i == directiveEnd) && word != "" && TemplateParser.isDirective(word)) {
+                        if (word == "verbatim") {                                    // @verbatim ... @endverbatim, as text
+                            let end = TemplateParser.find(s, "@endverbatim", j);
+                            if (end < 0) { self.fail(line, "@verbatim without @endverbatim"); }
+                            text.append(s[j..end]);
+                            line += TemplateParser.lines(s[j..end]);
+                            i = end + 12;
+                            continue;
+                        }
+                        self.textTok(text, textLine);
+                        let tok = new Tok(3, word, line);
+                        let k = j;
+                        while (k < n && s[k] as int == 32) { k += 1; }
+                        if (k < n && s[k] as int == 40) {
+                            let close = TemplateParser.matchParen(s, k);
+                            if (close < 0) { self.fail(line, "@" + word + "( is not closed"); }
+                            tok.args = s[k + 1..close];
+                            tok.hasArgs = true;
+                            line += TemplateParser.lines(s[k..close]);
+                            j = close + 1;
+                        }
+                        self.toks.push(tok);
+                        i = j;
+                        directiveEnd = i;
+                        // A directive alone on its line takes the line break with it.
+                        if (i < n && s[i] as int == 10 && TemplateParser.blockDirective(word)) { i += 1; line += 1; }
+                        textLine = line;
+                        continue;
+                    }
+                }
+                if (c == 60 && i + 2 < n && (s[i + 1] as int == 120 || (s[i + 1] as int == 47 && i + 3 < n && s[i + 2] as int == 120)) ) {   // <x- or </x-
+                    let close = s[i + 1] as int == 47;
+                    let start = close ? i + 2 : i + 1;
+                    if (start + 1 < n && s[start + 1] as int == 45) {
+                        let end = TemplateParser.tagEnd(s, start);
+                        if (end > 0) {
+                            self.textTok(text, textLine);
+                            let inner = s[start + 2..end];
+                            let selfClosing = !close && Str.endsWith(Str.trim(inner), "/");
+                            if (selfClosing) { inner = Str.trim(inner)[..Str.trim(inner).length - 1]; }
+                            self.toks.push(new Tok(close ? 5 : (selfClosing ? 6 : 4), Str.trim(inner), line));
+                            line += TemplateParser.lines(s[i..end]);
+                            i = end + 1;
+                            textLine = line;
+                            continue;
+                        }
+                    }
+                }
+                text.appendChar(c);
+                i += 1;
+            }
+            self.textTok(text, textLine);
+        }
+        private fn textTok(sb: StringBuilder, line: int) {
+            if (sb.length() == 0) { return; }
+            self.toks.push(new Tok(0, sb.toString(), line));
+            sb.clear();
+        }
+        static fn isWord(c: int) -> bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95; }
+        static fn isDirective(w: string) -> bool {
+            return Str.contains(",if,elseif,else,endif,unless,endunless,isset,endisset,empty,endempty,foreach,endforeach,forelse,endforelse," +
+                "switch,case,default,break,endswitch,include,includeIf,includeWhen,includeFirst,each,extends,section,endsection,show,yield," +
+                "parent,push,endpush,prepend,endprepend,stack,once,endonce,csrf,method,error,enderror,json,auth,endauth,guest,endguest,env,endenv," +
+                "checked,selected,disabled,readonly,required,class,set,verbatim,production,endproduction,stop,overwrite,append,", "," + w + ",");
+        }
+        static fn blockDirective(w: string) -> bool {
+            return !Str.contains(",csrf,method,json,checked,selected,disabled,readonly,required,class,yield,stack,include,includeIf,includeWhen,includeFirst,each,", "," + w + ",");
+        }
+        static fn find(s: string, sub: string, from: int) -> int {
+            if (from >= s.length) { return -1; }
+            let k = Str.indexOf(s[from..], sub);
+            return k < 0 ? -1 : k + from;
+        }
+        static fn lines(s: string) -> int { let k = 0; for (i in 0..s.length) { if (s[i] as int == 10) { k += 1; } } return k; }
+        // The ")" matching the "(" at `open`, skipping strings.
+        static fn matchParen(s: string, open: int) -> int {
+            let depth = 0;
+            let q = 0;
+            for (i in open..s.length) {
+                let c = s[i] as int;
+                if (q != 0) { if (c == 92) { continue; } if (c == q) { q = 0; } continue; }
+                if (c == 34 || c == 39) { q = c; }
+                else if (c == 40) { depth += 1; }
+                else if (c == 41) { depth -= 1; if (depth == 0) { return i; } }
+            }
+            return -1;
+        }
+        // The ">" ending a component tag that starts at `start`, skipping quoted attributes.
+        static fn tagEnd(s: string, start: int) -> int {
+            let q = 0;
+            for (i in start..s.length) {
+                let c = s[i] as int;
+                if (q != 0) { if (c == q) { q = 0; } continue; }
+                if (c == 34 || c == 39) { q = c; } else if (c == 62) { return i; } else if (c == 10 && i - start > 2000) { return -1; }
+            }
+            return -1;
+        }
+
+        // ── the tree ───────────────────────────────────────────────────────────
+        private fn expr(src: string, line: int) -> VExpr { return ExprParser.parse(src, self.name + ":" + "${line}"); }
+        private fn exprList(src: string, line: int) -> Array<VExpr> { return ExprParser.parseList(src, self.name + ":" + "${line}"); }
+        // Nodes until one of `ends` (left for the caller to consume).
+        private fn block(ends: Array<string>, t: Template) -> Array<TNode> {
+            let out = new Array<TNode>();
+            while (self.pos < self.toks.size()) {
+                let tok = self.toks[self.pos];
+                if (tok.kind == 3 && ends.contains(tok.text)) { return out; }
+                if (tok.kind == 5) { return out; }                                   // </x-...>: the caller's
+                self.pos += 1;
+                switch (tok.kind) {
+                    case 0: { let n = new TNode(0, tok.line); n.text = tok.text; out.push(n); }
+                    case 1, 2: { let n = new TNode(1, tok.line); n.raw = tok.kind == 2; n.expr = self.expr(tok.text, tok.line); out.push(n); }
+                    case 4, 6: out.push(self.component(tok, t))
+                    default: { let n = self.directive(tok, t); if (n != null) { out.push(n); } }
+                }
+            }
+            if (ends.size() > 0) { self.fail(self.toks.size() > 0 ? self.toks[self.toks.size() - 1].line : 1, "missing @" + ends[ends.size() - 1]); }
+            return out;
+        }
+        private fn expect(end: string) {
+            if (self.pos >= self.toks.size() || self.toks[self.pos].text != end) { self.fail(self.pos < self.toks.size() ? self.toks[self.pos].line : 0, "expected @" + end); }
+            self.pos += 1;
+        }
+        private fn directive(tok: Tok, t: Template) -> TNode {
+            let w = tok.text;
+            let line = tok.line;
+            switch (w) {
+                case "if", "unless", "isset", "empty", "auth", "guest", "env", "production", "error": return self.conditional(tok, t)
+                case "foreach", "forelse": {
+                    let n = new TNode(3, line);
+                    let a = tok.args;
+                    let asAt = Str.lastIndexOf(a, " as ");
+                    if (asAt < 0) { self.fail(line, "@" + w + " needs (items as item) or (items as key => item)"); }
+                    n.expr = self.expr(a[..asAt], line);
+                    let vars = Str.trim(a[asAt + 4..]);
+                    n.names = new Array<string>();
+                    let arrow = Str.indexOf(vars, "=>");
+                    if (arrow >= 0) { n.names.push(Str.trim(vars[arrow + 2..])); n.names.push(Str.trim(vars[..arrow])); }
+                    else { n.names.push(vars); }
+                    if (w == "forelse") {
+                        n.body = self.block(["empty", "endforelse"], t);
+                        if (self.pos < self.toks.size() && self.toks[self.pos].text == "empty") { self.pos += 1; n.other = self.block(["endforelse"], t); }
+                        self.expect("endforelse");
+                    } else {
+                        n.body = self.block(["endforeach"], t);
+                        self.expect("endforeach");
+                    }
+                    return n;
+                }
+                case "switch": {
+                    let n = new TNode(14, line);
+                    n.expr = self.expr(tok.args, line);
+                    n.exprs = new Array<VExpr>();
+                    n.bodies = new Array<Array<TNode>>();
+                    self.block(["case", "default", "endswitch"], t);                 // (whitespace before the first case)
+                    while (self.pos < self.toks.size() && self.toks[self.pos].text != "endswitch") {
+                        let c = self.toks[self.pos];
+                        self.pos += 1;
+                        let body = self.block(["case", "default", "break", "endswitch"], t);
+                        if (self.pos < self.toks.size() && self.toks[self.pos].text == "break") { self.pos += 1; self.block(["case", "default", "endswitch"], t); }
+                        if (c.text == "default") { n.other = body; } else { n.exprs.push(self.expr(c.args, c.line)); n.bodies.push(body); }
+                    }
+                    self.expect("endswitch");
+                    return n;
+                }
+                case "include", "includeIf", "includeWhen", "includeFirst", "each": {
+                    let n = new TNode(w == "each" ? 21 : 4, line);
+                    n.text = w;
+                    n.exprs = self.exprList(tok.args, line);
+                    return n;
+                }
+                case "extends": { t.extends = self.expr(tok.args, line); return null; }
+                case "section": {
+                    let args = self.exprList(tok.args, line);
+                    let n = new TNode(5, line);
+                    n.expr = args[0];
+                    if (args.size() > 1) { n.exprs = new Array<VExpr>(); n.exprs.push(args[1]); return n; }   // @section('title', 'Home')
+                    n.body = self.block(["endsection", "show", "stop", "overwrite", "append"], t);
+                    n.raw = self.toks[self.pos].text == "show";
+                    self.pos += 1;
+                    return n;
+                }
+                case "yield": { let n = new TNode(6, line); n.exprs = self.exprList(tok.args, line); return n; }
+                case "parent": return new TNode(20, line)
+                case "push", "prepend": {
+                    let n = new TNode(7, line);
+                    n.expr = self.expr(tok.args, line);
+                    n.raw = w == "prepend";
+                    n.body = self.block([w == "push" ? "endpush" : "endprepend"], t);
+                    self.pos += 1;
+                    return n;
+                }
+                case "stack": { let n = new TNode(8, line); n.expr = self.expr(tok.args, line); return n; }
+                case "once": {
+                    let n = new TNode(9, line);
+                    self.onceCount += 1;
+                    n.text = self.name + "#" + "${self.onceCount}";
+                    n.body = self.block(["endonce"], t);
+                    self.pos += 1;
+                    return n;
+                }
+                case "csrf": return new TNode(10, line)
+                case "method": { let n = new TNode(11, line); n.expr = self.expr(tok.args, line); return n; }
+                case "json": { let n = new TNode(13, line); n.expr = self.expr(tok.args, line); return n; }
+                case "checked", "selected", "disabled", "readonly", "required": {
+                    let n = new TNode(17, line); n.text = w; n.expr = tok.hasArgs ? self.expr(tok.args, line) : ExprParser.lit(true); return n;
+                }
+                case "class": { let n = new TNode(18, line); n.expr = self.expr(tok.args, line); return n; }
+                case "set": {
+                    let eq = Str.indexOf(tok.args, "=");
+                    if (eq < 1) { self.fail(line, "@set needs (name = value)"); }
+                    let n = new TNode(22, line); n.text = Str.trim(tok.args[..eq]); n.expr = self.expr(tok.args[eq + 1..], line); return n;
+                }
+                default: { self.fail(line, "@" + w + " without its opening directive"); return null; }
+            }
+        }
+        // @if/@unless/@isset/@empty/@auth/@guest/@env/@production/@error: branches of nodes.
+        private fn conditional(tok: Tok, t: Template) -> TNode {
+            let w = tok.text;
+            let line = tok.line;
+            let endName = w == "production" ? "endproduction" : "end" + w;
+            if (w == "error") {
+                let n = new TNode(12, line);
+                n.exprs = self.exprList(tok.args, line);
+                n.body = self.block(["else", "enderror"], t);
+                if (self.toks[self.pos].text == "else") { self.pos += 1; n.other = self.block(["enderror"], t); }
+                self.pos += 1;
+                return n;
+            }
+            if (w == "auth" || w == "guest" || w == "env" || w == "production") {
+                let n = new TNode(w == "auth" || w == "guest" ? 15 : 16, line);
+                n.raw = w == "guest";
+                n.exprs = tok.hasArgs ? self.exprList(tok.args, line) : new Array<VExpr>();
+                if (w == "production") { n.exprs.push(ExprParser.lit("production")); }
+                n.body = self.block(["else", endName], t);
+                if (self.toks[self.pos].text == "else") { self.pos += 1; n.other = self.block([endName], t); }
+                self.pos += 1;
+                return n;
+            }
+            let n = new TNode(2, line);
+            n.exprs = new Array<VExpr>();
+            n.bodies = new Array<Array<TNode>>();
+            let cond = self.expr(tok.args, line);
+            if (w == "unless" || w == "empty") { let u = new VExpr(6); u.name = "!"; u.a = cond; cond = u; }
+            if (w == "isset") { cond = ExprParser.bin("!=", cond, ExprParser.lit(null)); }
+            n.exprs.push(cond);
+            n.bodies.push(self.block(["elseif", "else", endName], t));
+            while (self.toks[self.pos].text == "elseif") {
+                let c = self.toks[self.pos];
+                self.pos += 1;
+                n.exprs.push(self.expr(c.args, c.line));
+                n.bodies.push(self.block(["elseif", "else", endName], t));
+            }
+            if (self.toks[self.pos].text == "else") { self.pos += 1; n.other = self.block([endName], t); }
+            self.expect(endName);
+            return n;
+        }
+        // <x-name attr="text" :attr="expr" flag>body, <x-slot:name>...</x-slot></x-name>
+        private fn component(tok: Tok, t: Template) -> TNode {
+            let n = new TNode(19, tok.line);
+            let inner = tok.text;
+            let sp = 0;
+            while (sp < inner.length && !(inner[sp] as int <= 32)) { sp += 1; }
+            n.text = inner[..sp];
+            n.names = new Array<string>();
+            n.exprs = new Array<VExpr>();
+            self.attributes(inner[sp..], n, tok.line);
+            n.body = new Array<TNode>();
+            n.slots = new HashMap<string, Array<TNode>>();
+            if (tok.kind == 6) { return n; }
+            while (true) {
+                let part = self.block(new Array<string>(), t);
+                for (x in part) { n.body.push(x); }
+                if (self.pos >= self.toks.size()) { self.fail(tok.line, "<x-" + n.text + "> is not closed"); }
+                let close = self.toks[self.pos];
+                self.pos += 1;
+                if (close.text == n.text) { break; }
+                if (close.kind == 5 && Str.startsWith(close.text, "slot")) { continue; }
+                self.fail(close.line, "</x-" + close.text + "> closes <x-" + n.text + ">");
+            }
+            // Named slots inside the body: <x-slot:title> or <x-slot name="title">.
+            let rest = new Array<TNode>();
+            for (x in n.body) {
+                if (x.kind == 19 && (Str.startsWith(x.text, "slot:") || x.text == "slot")) {
+                    let slotName = Str.startsWith(x.text, "slot:") ? x.text[5..] : "";
+                    if (slotName == "") { for (i, k in x.names) { if (k == "name" && x.exprs[i].kind == 0) { slotName = Eval.text(x.exprs[i].value); } } }
+                    n.slots.put(slotName, x.body);
+                } else { rest.push(x); }
+            }
+            n.body = rest;
+            return n;
+        }
+        private fn attributes(s: string, n: TNode, line: int) {
+            let i = 0;
+            while (i < s.length) {
+                while (i < s.length && s[i] as int <= 32) { i += 1; }
+                if (i >= s.length) { break; }
+                let start = i;
+                while (i < s.length && s[i] as int > 32 && s[i] as int != 61) { i += 1; }
+                let name = s[start..i];
+                let bound = Str.startsWith(name, ":");
+                if (bound) { name = name[1..]; }
+                if (i < s.length && s[i] as int == 61) {
+                    i += 1;
+                    let q = s[i] as int;
+                    let end = TemplateParser.find(s, q == 39 ? "'" : "\"", i + 1);
+                    if (end < 0) { self.fail(line, "unclosed attribute value in <x-" + n.text + ">"); }
+                    let value = s[i + 1..end];
+                    i = end + 1;
+                    n.names.push(name);
+                    n.exprs.push(bound ? self.expr(value, line) : ExprParser.lit(value));
+                } else {
+                    n.names.push(name);
+                    n.exprs.push(ExprParser.lit(true));
+                }
+            }
+        }
+    }
+}
