@@ -1,0 +1,263 @@
+// eval.grav — evaluating template expressions: variables through nested
+// scopes, member access on maps, lists, strings and objects, operators,
+// helpers and filters.
+import "std"
+import "apogee-http"
+import "expr.grav"
+
+namespace apogee {
+
+    // Variables, innermost first.
+    class Scope {
+        public vars: HashMap<string, any>
+        public parent: Scope
+        constructor(vars: HashMap<string, any>, parent: Scope) { self.vars = vars; self.parent = parent; }
+        fn lookup(name: string) -> any {
+            let s = self;
+            while (s != null) {
+                if (s.vars.containsKey(name)) { return s.vars[name]; }
+                s = s.parent;
+            }
+            return null;
+        }
+        fn has(name: string) -> bool {
+            let s = self;
+            while (s != null) { if (s.vars.containsKey(name)) { return true; } s = s.parent; }
+            return false;
+        }
+    }
+
+    // One render: its variables, sections and stacks, and what helpers need.
+    class RenderContext {
+        public scope: Scope
+        public helpers: HashMap<string, fn(Array<any>, RenderContext) -> any>
+        public sections: HashMap<string, string>
+        public stacks: HashMap<string, Array<string>>
+        public once: HashSet<string>
+        public loop: LoopVar
+        public request: Request
+        public view: string
+        // Renders another view inside this one (the factory's).
+        public include: fn(string, HashMap<string, any>, RenderContext) -> string
+        constructor(scope: Scope, helpers: HashMap<string, fn(Array<any>, RenderContext) -> any>) {
+            self.scope = scope; self.helpers = helpers;
+            self.sections = new HashMap<string, string>(); self.stacks = new HashMap<string, Array<string>>();
+            self.once = new HashSet<string>(); self.loop = null; self.request = null; self.view = ""; self.include = null;
+        }
+        fn push(vars: HashMap<string, any>) { self.scope = new Scope(vars, self.scope); }
+        fn pop() { self.scope = self.scope.parent; }
+        fn set(name: string, v: any) { self.scope.vars.put(name, v); }
+    }
+
+    class Eval {
+        static fn value(e: VExpr, ctx: RenderContext) -> any {
+            switch (e.kind) {
+                case 0: return e.value
+                case 1: return e.name == "loop" && ctx.loop != null && !ctx.scope.has("loop") ? ctx.loop as any : ctx.scope.lookup(e.name)
+                case 2: return Eval.member(Eval.value(e.a, ctx), e.name)
+                case 3: return Eval.index(Eval.value(e.a, ctx), Eval.value(e.b, ctx))
+                case 4: {
+                    let h = ctx.helpers.getOr(e.name, null);
+                    if (h == null) { throw new ViewError(ctx.view + ": no helper or filter called '" + e.name + "'"); }
+                    let args = new Array<any>();
+                    for (x in e.args) { args.push(Eval.value(x, ctx)); }
+                    return h(args, ctx);
+                }
+                case 5: {
+                    let args = new Array<any>();
+                    for (x in e.args) { args.push(Eval.value(x, ctx)); }
+                    return Eval.call(Eval.value(e.a, ctx), e.name, args, ctx);
+                }
+                case 6: {
+                    let v = Eval.value(e.a, ctx);
+                    if (e.name == "!") { return !Eval.truthy(v); }
+                    if (v is long) { return 0 - (v as long); }
+                    return 0.0 - Eval.number(v);
+                }
+                case 7: return Eval.binary(e, ctx)
+                case 8: return Eval.truthy(Eval.value(e.a, ctx)) ? Eval.value(e.b, ctx) : Eval.value(e.c, ctx)
+                case 9: {
+                    let out = new Array<any>();
+                    for (x in e.args) { out.push(Eval.value(x, ctx)); }
+                    return out;
+                }
+                default: {
+                    let m = new HashMap<string, any>();
+                    for (i, k in e.keys) { m.put(k, Eval.value(e.args[i], ctx)); }
+                    return m;
+                }
+            }
+        }
+        private static fn binary(e: VExpr, ctx: RenderContext) -> any {
+            let op = e.name;
+            if (op == "&&") { let l = Eval.value(e.a, ctx); return Eval.truthy(l) ? Eval.value(e.b, ctx) : l; }
+            if (op == "||") { let l = Eval.value(e.a, ctx); return Eval.truthy(l) ? l : Eval.value(e.b, ctx); }
+            if (op == "??") { let l = Eval.value(e.a, ctx); return l != null ? l : Eval.value(e.b, ctx); }
+            let a = Eval.value(e.a, ctx);
+            let b = Eval.value(e.b, ctx);
+            switch (op) {
+                case "==": return Eval.equal(a, b)
+                case "!=": return !Eval.equal(a, b)
+                case "<": return Eval.compare(a, b) < 0
+                case ">": return Eval.compare(a, b) > 0
+                case "<=": return Eval.compare(a, b) <= 0
+                case ">=": return Eval.compare(a, b) >= 0
+                case "in": return Eval.contains(b, a)
+                case "notin": return !Eval.contains(b, a)
+                case "~": return Eval.text(a) + Eval.text(b)
+                case "+": {
+                    if (a is string || b is string) { return Eval.text(a) + Eval.text(b); }
+                    if (a is long && b is long) { return (a as long) + (b as long); }
+                    return Eval.number(a) + Eval.number(b);
+                }
+                case "-": { if (a is long && b is long) { return (a as long) - (b as long); } return Eval.number(a) - Eval.number(b); }
+                case "*": { if (a is long && b is long) { return (a as long) * (b as long); } return Eval.number(a) * Eval.number(b); }
+                case "%": { if (a is long && b is long && (b as long) != 0) { return (a as long) % (b as long); } return 0; }
+                default: {
+                    let d = Eval.number(b);
+                    if (d == 0.0) { throw new ViewError(ctx.view + ": division by zero"); }
+                    return Eval.number(a) / d;
+                }
+            }
+        }
+
+        // ── values ─────────────────────────────────────────────────────────────
+        static fn truthy(v: any) -> bool {
+            if (v == null) { return false; }
+            if (v is bool) { return v as bool; }
+            if (v is long) { return (v as long) != 0; }
+            if (v is double) { return (v as double) != 0.0; }
+            if (v is string) { return (v as string) != ""; }
+            if (v is Array<any>) { return (v as Array<any>).size() > 0; }
+            if (v is HashMap<string, any>) { return (v as HashMap<string, any>).size() > 0; }
+            return true;
+        }
+        static fn number(v: any) -> double {
+            if (v is double) { return v as double; }
+            if (v is long) { return (v as long) as double; }
+            if (v is int) { return (v as int) as double; }
+            if (v is bool) { return (v as bool) ? 1.0 : 0.0; }
+            if (v is string) { return Format.toFloatOr(Str.trim(v as string), 0.0); }
+            return 0.0;
+        }
+        // How a value prints: "" for null, true/false, numbers, strings, else str().
+        static fn text(v: any) -> string {
+            if (v == null) { return ""; }
+            if (v is string) { return v as string; }
+            return str(v);
+        }
+        static fn equal(a: any, b: any) -> bool {
+            if (a == null || b == null) { return a == null && b == null; }
+            if ((a is long || a is double) && (b is long || b is double)) { return Eval.number(a) == Eval.number(b); }
+            if (a is bool || b is bool) { return Eval.truthy(a) == Eval.truthy(b); }
+            if (a is string || b is string) { return Eval.text(a) == Eval.text(b); }
+            return a == b;
+        }
+        static fn compare(a: any, b: any) -> int {
+            if ((a is long || a is double) && (b is long || b is double)) {
+                let x = Eval.number(a); let y = Eval.number(b);
+                return x < y ? -1 : (x > y ? 1 : 0);
+            }
+            let s = Eval.text(a); let t = Eval.text(b);
+            return s < t ? -1 : (s > t ? 1 : 0);
+        }
+        static fn contains(hay: any, needle: any) -> bool {
+            if (hay is Array<any>) { for (x in hay as Array<any>) { if (Eval.equal(x, needle)) { return true; } } return false; }
+            if (hay is HashMap<string, any>) { return (hay as HashMap<string, any>).containsKey(Eval.text(needle)); }
+            if (hay is string) { return Str.contains(hay as string, Eval.text(needle)); }
+            return false;
+        }
+        static fn size(v: any) -> int {
+            if (v is string) { return Utf8.count(v as string); }
+            if (v is Array<any>) { return (v as Array<any>).size(); }
+            if (v is HashMap<string, any>) { return (v as HashMap<string, any>).size(); }
+            return 0;
+        }
+        // A value as a list for @foreach (a map gives its values; null nothing).
+        static fn items(v: any) -> Array<any> {
+            if (v is Array<any>) { return v as Array<any>; }
+            let out = new Array<any>();
+            if (v is HashMap<string, any>) {
+                let keys = (v as HashMap<string, any>).keys();
+                Sort.sort(keys);
+                for (k in keys) { out.push((v as HashMap<string, any>)[k]); }
+            } else if (v is Array<string>) { for (x in v as Array<string>) { out.push(x); } }
+            return out;
+        }
+
+        static fn member(obj: any, name: string) -> any {
+            if (obj == null) { return null; }
+            if (obj is HashMap<string, any>) { return (obj as HashMap<string, any>).getOr(name, null); }
+            if (obj is LoopVar) { return (obj as LoopVar).get(name); }
+            if (name == "length" || name == "count" || name == "size") {
+                if (obj is string || obj is Array<any> || obj is HashMap<string, any>) { return Eval.size(obj); }
+            }
+            if (obj is Array<any>) {
+                let a = obj as Array<any>;
+                if (name == "first") { return a.size() > 0 ? a[0] : null; }
+                if (name == "last") { return a.size() > 0 ? a[a.size() - 1] : null; }
+                return null;
+            }
+            if (obj is HashMap<string, string>) { return (obj as HashMap<string, string>).getOr(name, "") as any; }
+            let info = ClassInfo.of(obj);
+            if (info == null || !info.isReflected()) { return null; }
+            let f = info.field(name);
+            if (f != null && f.canGet() && !f.isPrivate()) { return f.get(obj); }
+            let m = info.method(name);
+            if (m != null && m.paramCount() == 0 && m.canInvoke()) { return m.invoke(obj); }
+            return null;
+        }
+        static fn index(obj: any, key: any) -> any {
+            if (obj is Array<any>) {
+                let a = obj as Array<any>;
+                let i = Eval.number(key) as int;
+                if (i < 0) { i += a.size(); }
+                return i >= 0 && i < a.size() ? a[i] : null;
+            }
+            if (obj is string) {
+                let s = obj as string;
+                let i = Eval.number(key) as int;
+                return i >= 0 && i < s.length ? s[i..i + 1] as any : null;
+            }
+            return Eval.member(obj, Eval.text(key));
+        }
+        // A method: on lists, maps and strings the useful ones; on objects, by reflection.
+        static fn call(obj: any, name: string, args: Array<any>, ctx: RenderContext) -> any {
+            if (obj is string) {
+                let s = obj as string;
+                switch (name) {
+                    case "upper": return Str.upper(s)
+                    case "lower": return Str.lower(s)
+                    case "trim": return Str.trim(s)
+                    case "startsWith": return Str.startsWith(s, Eval.text(args[0]))
+                    case "endsWith": return Str.endsWith(s, Eval.text(args[0]))
+                    case "contains": return Str.contains(s, Eval.text(args[0]))
+                    case "replace": return Str.replace(s, Eval.text(args[0]), Eval.text(args[1]))
+                    case "split": { let out = new Array<any>(); for (p in Str.split(s, Eval.text(args[0]))) { out.push(p); } return out; }
+                    default: {}
+                }
+            }
+            if (obj is Array<any>) {
+                let a = obj as Array<any>;
+                switch (name) {
+                    case "contains": return Eval.contains(a, args.size() > 0 ? args[0] : null)
+                    case "join": { let parts = new Array<string>(); for (x in a) { parts.push(Eval.text(x)); } return Str.join(parts, args.size() > 0 ? Eval.text(args[0]) : ", "); }
+                    case "isEmpty": return a.size() == 0
+                    default: {}
+                }
+            }
+            if (obj is HashMap<string, any>) {
+                let m = obj as HashMap<string, any>;
+                switch (name) {
+                    case "has": return m.containsKey(Eval.text(args[0]))
+                    case "get": return m.getOr(Eval.text(args[0]), args.size() > 1 ? args[1] : null)
+                    case "keys": { let out = new Array<any>(); let ks = m.keys(); Sort.sort(ks); for (k in ks) { out.push(k); } return out; }
+                    default: {}
+                }
+            }
+            let info = ClassInfo.of(obj);
+            if (info == null || !info.isReflected()) { throw new ViewError(ctx.view + ": cannot call '" + name + "' on " + (obj == null ? "null" : typename(obj))); }
+            return info.invoke(obj, name, args);
+        }
+    }
+}
