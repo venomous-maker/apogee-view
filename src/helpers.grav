@@ -1,0 +1,164 @@
+// helpers.grav — the functions templates can call, each also usable as a
+// filter ({{ name | upper }} is upper(name)): text, numbers, dates, lists,
+// URLs, forms.
+import "std"
+import "apogee-http"
+import "expr.grav"
+import "eval.grav"
+import "factory.grav"
+
+namespace apogee {
+
+    class ViewHelpers {
+        static fn install(f: ViewFactory) {
+            let h = f.helpers;
+            let arg = fn(a: Array<any>, i: int) -> any { return i < a.size() ? a[i] : null; };
+            h.put("upper", fn(a: Array<any>, c: RenderContext) -> any { return Str.upper(Eval.text(arg(a, 0))); });
+            h.put("lower", fn(a: Array<any>, c: RenderContext) -> any { return Str.lower(Eval.text(arg(a, 0))); });
+            h.put("ucfirst", fn(a: Array<any>, c: RenderContext) -> any { let s = Eval.text(arg(a, 0)); return s == "" ? s : Str.upper(s[..1]) + s[1..]; });
+            h.put("title", fn(a: Array<any>, c: RenderContext) -> any {
+                let words = new Array<string>();
+                for (w in Str.split(Eval.text(arg(a, 0)), " ")) { words.push(w == "" ? w : Str.upper(w[..1]) + Str.lower(w[1..])); }
+                return Str.join(words, " ");
+            });
+            h.put("trim", fn(a: Array<any>, c: RenderContext) -> any { return Str.trim(Eval.text(arg(a, 0))); });
+            h.put("length", fn(a: Array<any>, c: RenderContext) -> any { return Eval.size(arg(a, 0)); });
+            h.put("count", fn(a: Array<any>, c: RenderContext) -> any { return Eval.size(arg(a, 0)); });
+            h.put("default", fn(a: Array<any>, c: RenderContext) -> any { let v = arg(a, 0); return Eval.truthy(v) ? v : arg(a, 1); });
+            h.put("e", fn(a: Array<any>, c: RenderContext) -> any { return HttpException.escape(Eval.text(arg(a, 0))); });
+            h.put("json", fn(a: Array<any>, c: RenderContext) -> any { return JsonWriter.encode(arg(a, 0)); });
+            h.put("join", fn(a: Array<any>, c: RenderContext) -> any {
+                let parts = new Array<string>();
+                for (x in Eval.items(arg(a, 0))) { parts.push(Eval.text(x)); }
+                return Str.join(parts, a.size() > 1 ? Eval.text(a[1]) : ", ");
+            });
+            h.put("truncate", fn(a: Array<any>, c: RenderContext) -> any {
+                let s = Eval.text(arg(a, 0));
+                let n = Eval.number(arg(a, 1)) as int;
+                let end = a.size() > 2 ? Eval.text(a[2]) : "...";
+                return Utf8.count(s) <= n ? s : Utf8.slice(s, 0, n) + end;
+            });
+            h.put("nl2br", fn(a: Array<any>, c: RenderContext) -> any { return Str.replace(HttpException.escape(Eval.text(arg(a, 0))), "\n", "<br>\n"); });
+            h.put("slug", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.slug(Eval.text(arg(a, 0))); });
+            h.put("plural", fn(a: Array<any>, c: RenderContext) -> any {
+                let n = Eval.number(arg(a, 0)) as long;
+                let word = Eval.text(arg(a, 1));
+                return "${n} " + (n == 1 ? word : (a.size() > 2 ? Eval.text(a[2]) : word + "s"));
+            });
+            h.put("number", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.number(Eval.number(arg(a, 0)), a.size() > 1 ? Eval.number(a[1]) as int : 0); });
+            h.put("round", fn(a: Array<any>, c: RenderContext) -> any { return Math.round(Eval.number(arg(a, 0))); });
+            h.put("abs", fn(a: Array<any>, c: RenderContext) -> any { return Math.abs(Eval.number(arg(a, 0))); });
+            h.put("min", fn(a: Array<any>, c: RenderContext) -> any { return Eval.compare(arg(a, 0), arg(a, 1)) <= 0 ? arg(a, 0) : arg(a, 1); });
+            h.put("max", fn(a: Array<any>, c: RenderContext) -> any { return Eval.compare(arg(a, 0), arg(a, 1)) >= 0 ? arg(a, 0) : arg(a, 1); });
+            h.put("range", fn(a: Array<any>, c: RenderContext) -> any {
+                let out = new Array<any>();
+                let lo = Eval.number(arg(a, 0)) as long;
+                let hi = Eval.number(arg(a, 1)) as long;
+                let i = lo;
+                while (i <= hi) { out.push(i); i += 1; }
+                return out;
+            });
+            h.put("keys", fn(a: Array<any>, c: RenderContext) -> any { return Eval.call(arg(a, 0), "keys", new Array<any>(), c); });
+            h.put("first", fn(a: Array<any>, c: RenderContext) -> any { return Eval.member(arg(a, 0), "first"); });
+            h.put("last", fn(a: Array<any>, c: RenderContext) -> any { return Eval.member(arg(a, 0), "last"); });
+            h.put("str", fn(a: Array<any>, c: RenderContext) -> any { return Eval.text(arg(a, 0)); });
+            // date(value, "%d %b %Y"): a DateTime, unix seconds, or a date string.
+            h.put("date", fn(a: Array<any>, c: RenderContext) -> any {
+                let v = arg(a, 0);
+                let d: DateTime = null;
+                if (v is DateTime) { d = v as DateTime; }
+                else if (v is long) { d = DateTime.fromUnix(v as long); }
+                else if (v is string) { d = DateTime.tryParse(v as string); }
+                else if (v == null) { d = DateTime.now(); }
+                if (d == null) { return Eval.text(v); }
+                return d.format(a.size() > 1 ? Eval.text(a[1]) : "%Y-%m-%d");
+            });
+            h.put("now", fn(a: Array<any>, c: RenderContext) -> any { return DateTime.now(); });
+            // URLs and forms.
+            h.put("route", fn(a: Array<any>, c: RenderContext) -> any {
+                if (f.urlFor == null) { throw new ViewError(c.view + ": route() needs ViewFactory.urlFor (the router's url)"); }
+                let params = arg(a, 1);
+                return f.urlFor(Eval.text(arg(a, 0)), params is HashMap<string, any> ? params as HashMap<string, any> : new HashMap<string, any>());
+            });
+            h.put("url", fn(a: Array<any>, c: RenderContext) -> any {
+                let p = Eval.text(arg(a, 0));
+                let root = c.request != null ? c.request.root() : "";
+                return root + (Str.startsWith(p, "/") ? p : "/" + p);
+            });
+            h.put("asset", fn(a: Array<any>, c: RenderContext) -> any { let p = Eval.text(arg(a, 0)); return f.assetRoot + (Str.startsWith(p, "/") ? p : "/" + p); });
+            h.put("old", fn(a: Array<any>, c: RenderContext) -> any { return c.request == null ? arg(a, 1) : c.request.old(Eval.text(arg(a, 0)), arg(a, 1)); });
+            h.put("csrf_token", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.csrfToken(c); });
+            h.put("class", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.classes(arg(a, 0)); });
+        }
+
+        // HTML-escapes `s` straight into `out`, in one pass (& < > " ').
+        static fn escapeInto(out: StringBuilder, s: string) {
+            let n = s.length;
+            let start = 0;
+            for (i in 0..n) {
+                let c = s[i] as int;
+                if (c != 38 && c != 60 && c != 62 && c != 34 && c != 39) { continue; }
+                if (i > start) { out.append(s[start..i]); }
+                if (c == 38) { out.append("&amp;"); } else if (c == 60) { out.append("&lt;"); } else if (c == 62) { out.append("&gt;"); }
+                else if (c == 34) { out.append("&quot;"); } else { out.append("&#39;"); }
+                start = i + 1;
+            }
+            if (start == 0) { out.append(s); } else if (start < n) { out.append(s[start..]); }
+        }
+        static fn csrfToken(ctx: RenderContext) -> string {
+            if (ctx.request != null && ctx.request.session is TokenStore) { return (ctx.request.session as TokenStore).token(); }
+            let local = ctx.scope.lookup("csrf_token");
+            return local == null ? "" : Eval.text(local);
+        }
+        // @class({"btn": true, "btn-active": isActive, "hidden": false}) or ["a", "b"]: the names that hold.
+        static fn classes(v: any) -> string {
+            let out = new Array<string>();
+            if (v is HashMap<string, any>) {
+                let keys = (v as HashMap<string, any>).keys();
+                Sort.sort(keys);
+                for (k in keys) { if (Eval.truthy((v as HashMap<string, any>)[k])) { out.push(k); } }
+            } else { for (x in Eval.items(v)) { if (Eval.text(x) != "") { out.push(Eval.text(x)); } } }
+            return Str.join(out, " ");
+        }
+        static fn camel(name: string) -> string {
+            if (Str.indexOf(name, "-") < 0) { return name; }
+            let parts = Str.split(name, "-");
+            let sb = new StringBuilder();
+            for (i, p in parts) { sb.append(i == 0 || p == "" ? p : Str.upper(p[..1]) + p[1..]); }
+            return sb.toString();
+        }
+        static fn slug(s: string) -> string {
+            let sb = new StringBuilder();
+            let dash = false;
+            for (i in 0..s.length) {
+                let c = Str.lower(s[i..i + 1])[0] as int;
+                if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) { sb.appendChar(c); dash = false; }
+                else if (!dash && sb.length() > 0) { sb.appendChar(45); dash = true; }
+            }
+            let out = sb.toString();
+            return Str.endsWith(out, "-") ? out[..out.length - 1] : out;
+        }
+        // 1234567.891 with 2 decimals -> "1,234,567.89".
+        static fn number(v: double, decimals: int) -> string {
+            let neg = v < 0.0;
+            let x = neg ? 0.0 - v : v;
+            let scale = 1.0;
+            for (i in 0..decimals) { scale = scale * 10.0; }
+            let r = Math.round(x * scale) / scale;
+            let whole = Math.floor(r) as long;
+            let digits = "${whole}";
+            let sb = new StringBuilder();
+            for (i in 0..digits.length) {
+                if (i > 0 && (digits.length - i) % 3 == 0) { sb.appendChar(44); }
+                sb.appendChar(digits[i] as int);
+            }
+            if (decimals > 0) {
+                let frac = Math.round((r - (whole as double)) * scale) as long;
+                let fs = "${frac}";
+                while (fs.length < decimals) { fs = "0" + fs; }
+                sb.appendChar(46).append(fs);
+            }
+            return (neg ? "-" : "") + sb.toString();
+        }
+    }
+}
