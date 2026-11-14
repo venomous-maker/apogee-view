@@ -1,0 +1,8 @@
+<html><head><title>@yield('title', 'Shop')</title>@stack('styles')</head>
+<body>
+@section('nav')
+<nav>Home</nav>
+@show
+<main>@yield('content')</main>
+@stack('scripts')
+</body></html>

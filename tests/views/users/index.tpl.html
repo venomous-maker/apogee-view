@@ -1,0 +1,20 @@
+@extends('layouts.app')
+@section('title', 'Users')
+@section('nav')
+@parent
+<nav>Users</nav>
+@endsection
+@section('content')
+@forelse(users as user)
+<li class="{{ loop.first ? 'first' : '' }}">{{ loop.iteration }}/{{ loop.count }} {{ user.name | upper }}@if(user.admin) (admin)@endif</li>
+@empty
+<p>No users</p>
+@endforelse
+@include('partials.footer', {"year": 2026})
+@endsection
+@push('scripts')
+<script src="{{ asset('app.js') }}"></script>
+@endpush
+@push('scripts')
+<script>one</script>
+@endpush

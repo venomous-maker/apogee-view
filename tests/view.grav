@@ -1,0 +1,133 @@
+// apogee-view's tests: expressions and filters, escaping, control flow,
+// loops, layouts with sections, @parent, stacks and includes, components with
+// slots, forms (@csrf, @method, @error, old()), helpers, caching, and errors.
+import "std"
+import "std/net"
+import "../src/all.grav"
+use apogee.*
+
+fn views() -> ViewFactory {
+    let f = new ViewFactory(["tests/views"])
+    f.share("appName", "Shop")
+    f.assetRoot = "/static"
+    return f
+}
+fn s(src: string, data: HashMap<string, any> = new HashMap<string, any>()) -> string { return views().renderString(src, data) }
+
+@ViewModel class Person {
+    public name: string  public age: long
+    constructor(name: string, age: long) { self.name = name; self.age = age }
+    fn greeting() -> string { return "Hi, " + self.name }
+}
+@ViewModel class Shown { public name: string = "Ada"  fn initials(n: long) -> string { return self.name[..n] } }
+
+test "expressions: members, indexes, operators, filters, escaping" {
+    let data: HashMap<string, any> = {"user": {"name": "<Ada>", "tags": ["a", "b"], "n": 3}, "price": 4.5, "qty": 2, "missing": null}
+    assertEq(s("{{ user.name }}|{!! user.name !!}", data), "&lt;Ada&gt;|<Ada>")
+    assertEq(s("{{ user.tags[1] }} {{ user.tags.length }} {{ user.n * qty + 1 }} {{ price * qty }}", data), "b 2 7 9")
+    assertEq(s("{{ missing ?? 'none' }} {{ user.n > 2 ? 'many' : 'few' }} {{ 'a' in user.tags }} {{ 'z' not in user.tags }}", data), "none many true true")
+    assertEq(s("{{ user.name | lower | e }} {{ 'hello world' | title }} {{ 1234567.891 | number(2) }} {{ 3 | plural('item') }}", data), "&amp;lt;ada&amp;gt; Hello World 1,234,567.89 3 items")
+    assertEq(s("{{ 'a,b' ~ '-' ~ 1 }} {{ \"x\" + 2 }} {{ -qty }} {{ !missing }}", data), "a,b-1 x2 -2 true")
+    assertEq(s("{{-- hidden --}}@{{ literal }} me@@example.com", data), "{{ literal }} me@example.com")
+    let obj = new HashMap<string, any>(); obj.put("p", reflect(Shown).create())
+    assertEq(s("{{ p.name }} {{ p.initials(2) }}", obj), "Ada Ad")
+}
+
+test "control flow: if/elseif/else, unless, isset, empty, switch, set" {
+    let data: HashMap<string, any> = {"n": 5, "list": [], "who": "b"}
+    assertEq(s("@if(n > 10) big @elseif(n > 3) mid @else small @endif", data), " mid ")
+    assertEq(s("@unless(n == 5)no@endunless@isset(n)set@endisset@empty(list)empty@endempty", data), "setempty")
+    assertEq(Str.trim(s("@switch(who)\n@case('a')\nA\n@break\n@case('b')\nB\n@break\n@default\nZ\n@endswitch", data)), "B")
+    assertEq(s("@set(total = n * 2){{ total }}", data), "10")
+}
+
+test "loops: foreach with loop, keys, nesting; forelse; each" {
+    let data: HashMap<string, any> = {"xs": ["a", "b", "c"], "m": {"k1": 1, "k2": 2}, "grid": [[1, 2], [3]]}
+    assertEq(s("@foreach(xs as x){{ loop.index }}{{ x }}{{ loop.last ? '' : ',' }}@endforeach", data), "0a,1b,2c")
+    assertEq(s("@foreach(m as k => v){{ k }}={{ v }};@endforeach", data), "k1=1;k2=2;")
+    assertEq(s("@foreach(grid as row)[@foreach(row as c){{ loop.depth }}{{ loop.parent.iteration }}{{ c }}@endforeach]@endforeach", data), "[211212][223]")
+    assertEq(s("@forelse([] as x)x@empty none@endforelse", data), " none")
+    assertEq(s("@each('partials.footer', [1, 2], 'year')", data), "<footer>1 Shop</footer>\n<footer>2 Shop</footer>\n")
+}
+
+test "layouts: sections, @parent, @show, @yield defaults, stacks, includes" {
+    let users = new Array<any>()
+    users.push({"name": "ada", "admin": true} as any)
+    users.push({"name": "bob", "admin": false} as any)
+    let html = views().render("users.index", {"users": users})
+    assertEq(Str.contains(html, "<title>Users</title>"), true)
+    assertEq(Str.contains(html, "<nav>Home</nav>\n<nav>Users</nav>"), true)          // @parent
+    assertEq(Str.contains(html, "<li class=\"first\">1/2 ADA (admin)</li>"), true)
+    assertEq(Str.contains(html, "<li class=\"\">2/2 BOB</li>"), true)
+    assertEq(Str.contains(html, "<footer>2026 Shop</footer>"), true)
+    assertEq(Str.contains(html, "<script src=\"/static/app.js\"></script>\n<script>one</script>"), true)
+    let empty = views().render("users.index", {"users": new Array<any>()})
+    assertEq(Str.contains(empty, "<p>No users</p>"), true)
+    let plain = views().render("layouts.app")
+    assertEq(Str.contains(plain, "<title>Shop</title>"), true)
+}
+
+test "components: attributes, bound attributes, slots, named slots" {
+    let out = s("<x-alert type=\"error\"><x-slot:title>Oops</x-slot:title>Something <i>broke</i></x-alert>|<x-badge :count=\"2 + 3\" label=\"hot\" />|<x-badge count=\"1\"/>")
+    assertEq(out, "<div class=\"alert alert-error\"><b>Oops</b> Something <i>broke</i></div>\n|<span data-count=\"5\">hot</span>\n|<span data-count=\"1\">new</span>\n")
+}
+
+class Flash implements FlashStore, OldInputStore, TokenStore {
+    fn flash(key: string, value: any) {}
+    fn flashed(key: string) -> any { return key == "errors" ? {"default": {"email": ["The email field is required."]}} as any : null }
+    fn oldInput(key: string) -> any { return key == "email" ? "ada@x.io" as any : null }
+    fn flashInput(values: HashMap<string, any>) {}
+    fn token() -> string { return "tok123" }
+}
+
+test "forms: csrf, method spoofing, errors, old input, attribute flags, class" {
+    let req = Request.make("GET", "/signup")
+    req.session = new Flash()
+    let f = views()
+    let t = "@csrf@method('put')|@error('email')<p>{{ message }}</p>@enderror|@error('name')x@else ok@enderror|{{ old('email') }}|<input @checked(true) @disabled(false)>|<b @class({\"on\": true, \"off\": false, \"big\": 1})>"
+    let path = "tests/views/_form.tpl.html"
+    new File(path).write(t)
+    let out = f.render("_form", new HashMap<string, any>(), req)
+    new File(path).delete()
+    assertEq(out, "<input type=\"hidden\" name=\"_token\" value=\"tok123\"><input type=\"hidden\" name=\"_method\" value=\"PUT\">|<p>The email field is required.</p>| ok|ada@x.io|<input checked >|<b class=\"big on\">")
+    assertEq(f.response(req, "partials.footer", {"year": 1}).getHeader("Content-Type"), "text/html; charset=utf-8")
+}
+
+test "helpers, environment, auth, route() and errors with line numbers" {
+    let f = views()
+    f.environment = "local"
+    f.urlFor = fn(name: string, p: HashMap<string, any>) -> string { return "/" + name + "/" + Eval.text(p.getOr("id", "")) }
+    f.helper("shout", fn(a: Array<any>, c: RenderContext) -> any { return Eval.text(a[0]) + "!" })
+    assertEq(f.renderString("{{ route('users', {\"id\": 7}) }} {{ 'hi' | shout }} @env('local', 'dev')L@else P@endenv @production P@else D@endproduction"), "/users/7 hi! L  D")
+    let req = Request.make("GET", "/")
+    req.user = new Person("Ada", 36)
+    let tpl = "tests/views/_auth.tpl.html"
+    new File(tpl).write("@auth{{ user.name }}@endauth@guest guest@endguest")
+    assertEq(f.render("_auth", new HashMap<string, any>(), req), "Ada")
+    assertEq(f.render("_auth"), " guest")
+    new File(tpl).delete()
+    let msg = ""
+    try { f.renderString("line one\n{{ broken( }}") } catch (e: ViewError) { msg = e.message() }
+    assertEq(Str.contains(msg, "(string):2"), true)
+    msg = ""
+    try { f.render("nope.missing") } catch (e: ViewError) { msg = e.message() }
+    assertEq(Str.startsWith(msg, "no view 'nope.missing'"), true)
+    msg = ""
+    try { f.renderString("@if(true) never closed") } catch (e: ViewError) { msg = e.message() }
+    assertEq(Str.contains(msg, "missing @endif"), true)
+}
+
+test "templates are parsed once, and again when the file changes" {
+    let f = views()
+    let path = "tests/views/_cache.tpl.html"
+    new File(path).write("one")
+    assertEq(f.render("_cache"), "one")
+    assertEq(f.load("_cache") == f.load("_cache"), true)
+    Time.sleepMs(1100)
+    new File(path).write("two")
+    assertEq(f.render("_cache"), "two")
+    f.checkForChanges = false
+    new File(path).write("three")
+    assertEq(f.render("_cache"), "two")
+    new File(path).delete()
+}
