@@ -81,7 +81,7 @@ in its hierarchy, as Orbit models have. Strings, lists and maps have
 `trim`, `length`, `count`, `default`, `e`, `json`, `join`, `truncate`,
 `nl2br`, `slug`, `plural`, `number(v, decimals)`, `round`, `abs`, `min`,
 `max`, `range`, `keys`, `first`, `last`, `str`, `date(v, "%d %b %Y")`,
-`now`, `route(name, params)`, `url`, `asset`, `old`, `csrf_token`, `class`.
+`now`, `route(name, params)`, `url`, `asset`, `old`, `session(key, default)` (a flashed value), `csrf_token`, `class`.
 
 ## With a request
 

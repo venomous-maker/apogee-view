@@ -89,6 +89,7 @@ test "forms: csrf, method spoofing, errors, old input, attribute flags, class" {
     new File(path).write(t)
     let out = f.render("_form", new HashMap<string, any>(), req)
     new File(path).delete()
+    assertEq(f.renderString("{{ session('status', 'none') }}"), "none")
     assertEq(out, "<input type=\"hidden\" name=\"_token\" value=\"tok123\"><input type=\"hidden\" name=\"_method\" value=\"PUT\">|<p>The email field is required.</p>| ok|ada@x.io|<input checked >|<b class=\"big on\">")
     assertEq(f.response(req, "partials.footer", {"year": 1}).getHeader("Content-Type"), "text/html; charset=utf-8")
 }

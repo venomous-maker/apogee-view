@@ -88,6 +88,13 @@ namespace apogee {
             h.put("asset", fn(a: Array<any>, c: RenderContext) -> any { let p = Eval.text(arg(a, 0)); return f.assetRoot + (Str.startsWith(p, "/") ? p : "/" + p); });
             h.put("old", fn(a: Array<any>, c: RenderContext) -> any { return c.request == null ? arg(a, 1) : c.request.old(Eval.text(arg(a, 0)), arg(a, 1)); });
             h.put("csrf_token", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.csrfToken(c); });
+            // A value flashed to the session by the last request (session('status')), else the default.
+            h.put("session", fn(a: Array<any>, c: RenderContext) -> any {
+                let fallback = arg(a, 1);
+                if (c.request == null || !(c.request.session is FlashStore)) { return fallback; }
+                let v = (c.request.session as FlashStore).flashed(Eval.text(arg(a, 0)));
+                return v == null ? fallback : v;
+            });
             h.put("class", fn(a: Array<any>, c: RenderContext) -> any { return ViewHelpers.classes(arg(a, 0)); });
         }
 
