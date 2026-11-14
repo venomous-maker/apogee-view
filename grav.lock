@@ -1,0 +1,3 @@
+# grav.lock: exact commits of the installed dependencies (generated; commit this file)
+apogee-container = { source = "github.com/venomous-maker/apogee-container", version = "", commit = "d25e33256e482a0a2c115c26c421b2e4cd12cf3a" }
+apogee-http = { source = "github.com/venomous-maker/apogee-http", version = "", commit = "e34c2bd89a183aeabf7e66a962d1d4dcba140140" }
