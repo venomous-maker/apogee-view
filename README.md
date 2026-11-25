@@ -5,7 +5,7 @@ where it makes sense, plus filters and a few more directives. Templates are
 files (`resources/views/users/show.tpl.html` is `"users.show"`), parsed once
 into a tree and re-read only when the file changes (`checkForChanges`).
 
-```grav
+```typescript
 import "std"
 import "apogee-view"
 
